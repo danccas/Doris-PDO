@@ -37,6 +37,9 @@ final class Doris {
     return static::getInstance($cdr);
   }
   public static function getInstance($cdr = null) {
+    if($cdr instanceof Doris) {
+      return $cdr;
+    }
     if(!empty($cdr)) {
       $cdr = strtolower($cdr);
     }
@@ -145,6 +148,7 @@ final class Doris {
   }
   function debug($x = true) { 
     $this->log = $x;
+    return $this;
   }
   function connect() {
     if ($this->protocol == 'mongodb') {
@@ -249,6 +253,16 @@ final class Doris {
     $this->exec($sql, $nfields);
     return $this->last_insert_id();
   }
+  function call($sp, $fields = null) {
+    $fls = array();
+    if(!empty($fields)) {
+      foreach ($fields as $field => $value) {
+        $fls[] = '?';
+      }
+    }
+    $this->exec('SELECT ' . $sp . '(' . implode(',', $fls) . ')', $fields);
+    return true;
+  }
   function delete($table, $where = null) {
     $sql = "DELETE FROM " . $table;
     if (empty($where)) {
@@ -259,7 +273,7 @@ final class Doris {
     return true;
   }
   function deleteLogic($table, $where = null) {
-    $sql = "UPDATE " . $table . ' SET eliminado = NOW()';
+    $sql = "UPDATE " . $table . ' SET deleted = NOW()';
     if (empty($where)) {
       return false;
     }
@@ -307,10 +321,10 @@ final class Doris {
     paginacion, orden, limite, opciones
   */
 #  function pagination($query, Pagination $pagination = null) {
-  function pagination($query, &$pagination = null) {
+  function pagination($query, &$pagination = null, $prepare = null) {
 
     if(is_null($pagination)) {
-      return $this->get($query);
+      return $this->get($query, false, null, $prepare);
     }
     if(!($pagination instanceof Pagination)) {
       $pagination = new Pagination('p5');
@@ -328,13 +342,17 @@ final class Doris {
     } else {
       $this->except('type invalid');
     }
-    $total = $this->count($query_encapsule);
+    $total = $this->count($query_encapsule, $prepare);
     if(!$pagination->setNumResults($total)) {
       return false;
     }
 
     if($this->type == 'pdo') {
-      $query = "SELECT * FROM (" . $query . ")x LIMIT " . $pagination->cantidad . " OFFSET " . $pagination->offset;
+      $query  = "SELECT * FROM (" . $query . ")x ";
+      if(!empty($pagination->orden_sql)) {
+        $query .= "ORDER BY " . $pagination->orden_sql . " ";
+      }
+      $query .= "LIMIT " . $pagination->cantidad . " OFFSET " . $pagination->offset;
 
     } elseif($this->type == 'mongodb') {
       $query[2] = array_merge($query[2], array(
@@ -344,7 +362,7 @@ final class Doris {
     } else {
       $this->except('type invalid');
     }
-    $rp = $this->get($query);
+    $rp = $this->get($query, false, null, $prepare);
     if(!empty($rp)) {
       $_rp = array();
       foreach($rp as $k => $n) {
@@ -395,9 +413,9 @@ final class Doris {
       return $ce->std_to_array($n);
     }, $d) : $d;
   }
-  function count($query) {
+  function count($query, $prepare = null) {
     if($this->type == 'pdo') {
-      $rp = $this->get($query, true);
+      $rp = $this->get($query, true, null, $prepare);
       return !empty($rp) ? array_shift($rp) : 0;
 
     } elseif($this->type == 'mongodb') {
