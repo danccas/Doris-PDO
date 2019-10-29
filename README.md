@@ -61,6 +61,17 @@ $db->update('tablename', array('deleted' =>NULL), 'id ='.$n['id']);
 
 ```
 
+# INSERT_UPDATE
+
+esta funcion lo usamos cuando queremos insertar un dato nuevo
+pero si ya existe actualizarlo
+
+```php
+$db->insert_update('tabla', $data, 'id = ' . $id);
+
+```
+
+
 # ELIMINACION LOGICA
 
 ```php
