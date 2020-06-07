@@ -1,9 +1,10 @@
 <?php
 final class Doris {
-  private static $instances = array();
+  private static $instances = null;
   private static $listdsn   = array();
 
-  private $connection;
+  private $established = false;
+  private $connection = null;
   private $type;
   private $dsn;
   private $protocol;
@@ -13,8 +14,14 @@ final class Doris {
   private $parameters = [];
 
   private $log = false;
-  private $flog  = 'doris.log';
+  private $flog  = __DIR__ . '/doris.log';
 
+  public static function importRoute($route) {
+    if(static::$instances === null) {
+      static::$instances = new stdClass();
+    }
+    return static::$instances;
+  }
   public static function showConnections() {
     return array(
       'dsn' => static::$listdsn,
@@ -32,41 +39,46 @@ final class Doris {
       }
     }
     static::$listdsn[$cdr] = $dsn;
+    static::g($cdr); #TODO
   }
   public static function g($cdr = null) {
     return static::getInstance($cdr);
   }
   public static function getInstance($cdr = null) {
+    if(static::$instances === null) {
+      static::$instances = new stdClass();
+    }
     if($cdr instanceof Doris) {
       return $cdr;
     }
     if(!empty($cdr)) {
       $cdr = strtolower($cdr);
     }
-    if(!is_null($cdr) && !array_key_exists($cdr, static::$instances)) {
+    if(!is_null($cdr) && !property_exists(static::$instances, $cdr)) {
       if(array_key_exists($cdr, static::$listdsn)) {
         if(strpos(static::$listdsn[$cdr], '&') === 0) {
           $cdr = trim(static::$listdsn[$cdr], '&');
-          if(array_key_exists($cdr, static::$instances)) {
-            return static::$instances[$cdr];
+          if(property_exists(static::$instances, $cdr)) {
+            return static::$instances->$cdr;
           } else {
-            return static::$instances[$cdr] = new static(static::$listdsn[$cdr]);
+            return static::$instances->$cdr = new static(static::$listdsn[$cdr]);
           }
         } else {
-          return static::$instances[$cdr] = new static(static::$listdsn[$cdr]);
+          return static::$instances->$cdr = new static(static::$listdsn[$cdr]);
         }
       } else {
-        trigger_error('DSN no existe');
+        trigger_error('DSN no existe: ' . $cdr);
       }
     }
     if(is_null($cdr)) {
       if(empty(static::$instances)) {
         trigger_error('No se ha iniciado una Instancia');
+        exit;
       } else {
         return reset(static::$instances);
       }
     }
-    return static::$instances[$cdr];
+    return static::$instances->$cdr;
   }
   function __construct($dsn) {
     return $this->_init($dsn);
@@ -139,37 +151,47 @@ final class Doris {
       $this->parameters[$kv[0]] = isset($kv[1]) ? $kv[1] : null;
     }
   }
+  function establishConnection() {
+    if(!$this->established) {
+      $this->established = true;
+      $this->connection = ($this->connection)();
+      if($this->type == 'pdo') {
+        $this->exec('SET CHARACTER SET utf8');
+      }
+    }
+  }
   function _init($dsn) {
     $this->parseDsn($dsn);
     $this->connect();
-    if(!is_null($this->connection) && $this->type == 'pdo') {
-      $this->exec("SET CHARACTER SET utf8");
-    }
   }
   function debug($x = true) { 
     $this->log = $x;
     return $this;
   }
   function connect() {
-    if ($this->protocol == 'mongodb') {
-      $this->type = 'mongodb';
-      $db = new MongoDB\Driver\Manager($this->protocol . '://' . $this->hosts['host'] . ':' . $this->hosts['port']);
-      if (!$db) {
-        $this->except("<b>Doris:</b> Can't connect to the database! ");
+    $ce = $this;
+    $this->connection = function() use(&$ce) {
+      if ($ce->protocol == 'mongodb') {
+        $ce->type = 'mongodb';
+        $db = new MongoDB\Driver\Manager($ce->protocol . '://' . $ce->hosts['host'] . ':' . $ce->hosts['port']);
+        if (!$db) {
+          $ce->except("<b>Doris:</b> Can't connect to the database! ");
+        }
+      } else {
+        $ce->type = 'pdo';
+        try {
+          $dsn = $ce->protocol . ':host=' . $ce->hosts['host'] . ';dbname=' . $ce->database;
+          $db = new PDO($dsn, $ce->authentication['username'], $ce->authentication['password']);
+          $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        } catch (PDOException $e) {
+          $ce->except('<b>Doris:</b> Can\'t connect to database ' . $ce->protocol . '!');
+        }
       }
-    } else {
-      $this->type = 'pdo';
-      try {
-        $dsn = $this->protocol . ':host=' . $this->hosts['host'] . ';dbname=' . $this->database;
-        $db = new PDO($dsn, $this->authentication['username'], $this->authentication['password']);
-        $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-      } catch (PDOException $e) {
-        $this->except('<b>Doris:</b> Can\'t connect to database ' . $this->protocol . '!');
-      }
-    }
-    $this->connection = $db;
+      return $db;
+    };
   }
   function exec($query, $prepare = null, $is_cmd = false) {
+    $this->establishConnection();
     if ($this->type == 'pdo') {
       if($this->log) {
         _log($this->flog, $query, $prepare, $is_cmd);
@@ -210,48 +232,86 @@ final class Doris {
     }
     return $result;
   }
+  static function process_data($type = 'set', $fields, &$fieldlist = null, &$datalist = null, &$duplelist = null) {
+    $fieldlist = array();
+    $valuelist = array();
+    $datalist  = array();
+    $duplelist = array();
+    if(!is_array($fields)) {
+      $fieldlist = $fields;
+      return;
+    }
+    array_walk($fields, function(&$value, $field) {
+      $n['duple'] = strpos($field, '*') === 0;
+      $n['equal'] = strpos($field, '=') === strlen($field) - 1;
+      $n['field'] = str_replace('*', '', str_replace('=', '', $field));
+      $n['id']    = str_replace('_', '', $n['field']);
+      $n['value'] = is_null($value) ? 'NULL' : $value;
+      $value = $n;
+    });
+    if($type == 'set') {
+      foreach ($fields as $n) {
+        if($n['equal']) {
+          $fieldlist[] = $n['field'] . ' = ' . $n['value'];
+          if($n['duple']) {
+            $duplelist[] = $n['field'] . ' = ' . $n['value'];
+          }
+        } else {
+          $fieldlist[] = $n['field'] . ' = :' . $n['id'];
+          $datalist[$n['id']] = $n['value'];
+          if($n['duple']) {
+            $duplelist[] = $n['field'] . ' = :' . $n['id'];
+          }
+        }
+      }
+      $fieldlist = implode(', ', $fieldlist);
+      $duplelist = implode(', ', $duplelist);
+    } else {
+      foreach ($fields as $n) {
+        if($n['equal']) {
+          $fieldlist[] = $n['field'];
+          $valuelist[] = $n['value'];
+        } else {
+          $fieldlist[] = $n['field'];
+          $valuelist[] = ':' . $n['id'];
+          $datalist[$n['id']] = $n['value'];
+        }
+      }
+      $fieldlist = '(' . implode(', ', $fieldlist) . ') VALUES (' . implode(', ', $valuelist) . ')';
+    }
+  }
   function cmd($command, $first = false) {
-    return $this->get($command, $first, $is_command = true);
+#    return $this->get($command, $first, $is_command = true);
   }
   function insert($table, $fields, $ignore = false) {
     if(empty($fields)) {
       return false;
     }
-    $fieldlist = '';
-    $valuelist = '';
-    foreach ($fields as $field => $value) {
-      $value = is_null($value) ? 'NULL' : "'" . $this->escape($value) . "'";
-      $fieldlist .= ($fieldlist == '' ? '' : ', ') . $field;
-      $valuelist .= ($valuelist == '' ? '' : ', ') . '?';
+    static::process_data('values', $fields, $fieldlist, $datalist, $duplelist);
+    $sql = 'INSERT ' . ($ignore ? 'IGNORE ' : '') . ' INTO ' . $table;
+    $sql .= $fieldlist;
+    if(!empty($duplelist)) {
+      $sql .= ' ON DUPLICATE KEY UPDATE ' . $duplelist;
     }
-    $sql = "INSERT " . ($ignore ? 'IGNORE ' : '') . "INTO " . $table . " (" . $fieldlist . ") VALUES (" . $valuelist .")";
-    $this->exec($sql, array_values($fields));
+    $this->exec($sql, $datalist);
     return $this->last_insert_id();
   }
-  function insert_update($table, $fields) {
+  function update($table, $fields, $where = null) {
     if(empty($fields)) {
       return false;
     }
-    $fieldlist  = '';
-    $valuelist  = '';
-    $updatelist = '';
-    $tag = '*';
-    $nfields = array();
-    foreach ($fields as $field => $value) {
-      $uniq = strpos($field, $tag) !== false;
-      $field = str_replace('*', '', $field);
-      #$value = is_null($value) ? 'NULL' : "'" . $this->escape($value) . "'";
-      $fieldlist .= ($fieldlist == '' ? '' : ', ') . $field;
-      $fieldl = str_replace('_', '', $field);
-      $valuelist .= ($valuelist == '' ? '' : ', ') . ':' . $fieldl;
-      if(!$uniq) {
-        $updatelist .= ($updatelist == '' ? '' : ', ') . $field . ' = :' . $fieldl;
-      }
-      $nfields[$fieldl] = $value;
+    if (empty($where)) {
+      return false;
     }
-    $sql = "INSERT INTO " . $table . " (" . $fieldlist . ") VALUES (" . $valuelist .") ON DUPLICATE KEY UPDATE " . $updatelist . ";";
-    $this->exec($sql, $nfields);
-    return $this->last_insert_id();
+    static::process_data('set', $fields, $fieldlist, $datalist);
+    $sql = 'UPDATE ' . $table . ' SET ' . $fieldlist;
+
+    static::process_data('set', $where, $wherelist, $datalistw);
+    if(!empty($wherelist)) {
+      $sql .= ' WHERE ' . $wherelist;
+    }
+    $this->exec($sql, array_merge($datalist, $datalistw));
+    return true;
   }
   function call($sp, $fields = null) {
     $fls = array();
@@ -268,8 +328,9 @@ final class Doris {
     if (empty($where)) {
       return false;
     }
-    $sql .= " WHERE " . $where;
-    $this->exec($sql);
+    static::process_data('set', $where, $wherelist, $datalistw);
+    $sql .= 'WHERE ' . $wherelist;
+    $this->exec($sql, $datalistw);
     return true;
   }
   function deleteLogic($table, $where = null) {
@@ -281,46 +342,10 @@ final class Doris {
     $this->exec($sql);
     return true;
   }
-  function update($table, $fields, $where = null) {
-    $valuelist = $this->_sql_construct_set($fields);
-    if(empty($valuelist)) {
-      return false;
-    }
-    $valuelist = ' SET ' . $valuelist;
-    $sql = "UPDATE " . $table . $valuelist;
-    if (empty($where)) {
-      return false;
-    }
-    $sql .= " WHERE " . $where;
-    $this->exec($sql, array_values($fields));
-    return true;
-  }
-  private function _sql_construct_set($fields) {
-    $valuelist = '';
-    if(!empty($fields)) {
-      foreach ($fields as $field => $value) {
-        if(is_null($value)) {
-          $value = "NULL";
-        } elseif(preg_match("/^(?<signo>[+-])(?<num>\d+)$/", $value, $m)) {
-          if($m['signo'] == '+') {
-            $value = $field . ' + ' . $m['num'];
-          } elseif($m['signo'] == '-') {
-            $value = $field . ' - ' . $m['num'];
-          }
-        } else {
-          $value = "'" . $this->escape($value) . "'";
-        }
-
-        $valuelist .= ($valuelist == "" ? "" : ", ") . $field . ' = ?';// . $value;
-      }
-    }
-    return $valuelist;
-  }
   /*
     Vinculamos a Doris con la libreria Tablefy para el acceso de los datos como:
     paginacion, orden, limite, opciones
   */
-#  function pagination($query, Pagination $pagination = null) {
   function pagination($query, &$pagination = null, $prepare = null) {
 
     if(is_null($pagination)) {
@@ -329,7 +354,7 @@ final class Doris {
     if(!($pagination instanceof Pagination)) {
       $pagination = new Pagination('p5');
     }
-    if(!$pagination->setRequest()) {
+    if(is_null($pagination->link) && !$pagination->setRequest()) {
       return false;
     }
     if($this->type == 'pdo') {
@@ -349,8 +374,8 @@ final class Doris {
 
     if($this->type == 'pdo') {
       $query  = "SELECT * FROM (" . $query . ")x ";
-      if(!empty($pagination->orden_sql)) {
-        $query .= "ORDER BY " . $pagination->orden_sql . " ";
+      if(!empty($pagination->order_by)) {
+        $query .= 'ORDER BY ' . $pagination->order_by . ' ';
       }
       $query .= "LIMIT " . $pagination->cantidad . " OFFSET " . $pagination->offset;
 
@@ -376,8 +401,8 @@ final class Doris {
   function query($sql) {
     return $sql;
   }
-  function get($sql, $first = false, $is_command = false, $prepare = null) {
-    $result = $this->exec ($sql, $prepare, $is_command);
+  function get($sql, $first = false, $prepare = null) {
+    $result = $this->exec ($sql, $prepare, false);
     if($result === false) {
       return false;
     }
@@ -435,6 +460,7 @@ final class Doris {
     return str_replace("'", "\\'", $string);
   }
   function last_insert_id() {
+    $this->establishConnection();
     if ($this->type == 'pdo') {
       return $this->connection->lastInsertId();
 
@@ -460,6 +486,7 @@ final class Doris {
     }
   }
   function transaction() {
+    $this->establishConnection();
     _log($this->flog, 'INI TRANSACTION =>');
     if($this->type == 'pdo') {
       return $this->connection->beginTransaction();
@@ -468,6 +495,7 @@ final class Doris {
     }
   }
   function commit() {
+    $this->establishConnection();
     _log($this->flog, ' <= END TRANSACTION: COMMIT');
     if($this->type == 'pdo') {
       return $this->connection->commit();
@@ -476,6 +504,7 @@ final class Doris {
     }
   }
   function rollback() {
+    $this->establishConnection();
     _log($this->flog, ' <= END TRANSACTION: ROLLBACK');
     if($this->type == 'pdo') {
       return $this->connection->rollback();
